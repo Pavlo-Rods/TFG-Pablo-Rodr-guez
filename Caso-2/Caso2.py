@@ -60,123 +60,204 @@ ollama_config_mistral = {
     ],
 }
 
-# FUNCIÓN PARA EXTRAER Y GUARDAR CÓDIGO AUTOMÁTICAMENTE
+# FUNCIÓN MEJORADA PARA EXTRAER Y GUARDAR CÓDIGO AUTOMÁTICAMENTE
 def extract_and_save_code(message_content, agent_name):
     """Extrae código de los mensajes y lo guarda automáticamente en archivos"""
     
-    # Patrones para detectar diferentes tipos de código
-    patterns = {
-        'snake_logic.py': r'```python\s*#.*?snake_logic\.py.*?\n(.*?)```',
-        'snake_game.py': r'```python\s*#.*?snake_game\.py.*?\n(.*?)```',
-        'test_snake.py': r'```python\s*#.*?test_snake\.py.*?\n(.*?)```',
-        'README.md': r'```markdown\s*#.*?README\.md.*?\n(.*?)```',
-        'requirements.txt': r'```(?:txt|text)\s*#.*?requirements\.txt.*?\n(.*?)```',
-    }
-    
-    # También buscar patrones más generales
-    general_patterns = {
-        'snake_logic.py': r'class Snake.*?(?=class \w+|$|\n\n```)',
-        'snake_game.py': r'import pygame.*?(?=\n\n```|$)',
-        'test_snake.py': r'import unittest.*?(?=\n\n```|$)',
-    }
+    if not message_content or not isinstance(message_content, str):
+        return []
     
     files_created = []
     
-    for filename, pattern in patterns.items():
-        matches = re.findall(pattern, message_content, re.DOTALL | re.IGNORECASE)
-        if matches:
-            # Tomar el match más largo (más completo)
-            code_content = max(matches, key=len).strip()
-            if len(code_content) > 50:  # Solo guardar si tiene contenido sustancial
-                filepath = os.path.join(OUTPUT_DIR, filename)
-                try:
-                    with open(filepath, 'w', encoding='utf-8') as f:
-                        f.write(code_content)
-                    files_created.append(filename)
-                    print(f"[OK] {agent_name} -> {filename} guardado ({len(code_content)} chars)")
-                except Exception as e:
-                    print(f"[ERROR] Error guardando {filename}: {e}")
+    # PRIMERO: Buscar comentarios que especifiquen nombre de archivo
+    # Patrones como: # snake_logic.py, # output/snake_logic.py, etc.
+    file_comment_pattern = r'#\s*(?:output/)?([a-zA-Z0-9_]+\.(?:py|txt|md))'
+    file_comments = re.findall(file_comment_pattern, message_content)
     
-    # Si no encontró archivos específicos, buscar por contenido
-    if not files_created:
-        if 'class Snake' in message_content and 'snake_logic' not in [f.lower() for f in files_created]:
-            code_blocks = re.findall(r'```python\n(.*?)```', message_content, re.DOTALL)
-            for block in code_blocks:
-                if 'class Snake' in block:
-                    filepath = os.path.join(OUTPUT_DIR, 'snake_logic.py')
-                    with open(filepath, 'w', encoding='utf-8') as f:
-                        f.write(block.strip())
-                    files_created.append('snake_logic.py')
-                    print(f"[OK] {agent_name} -> snake_logic.py extraido automaticamente")
-                    break
+    # Patrón para capturar bloques de código con o sin especificador de lenguaje
+    code_patterns = [
+        r'```python\s*\n(.*?)```',
+        r'```(?:txt|text|markdown|md|)\s*\n(.*?)```',
+        r'```\s*\n(.*?)```',
+    ]
+    
+    all_code_blocks = []
+    for pattern in code_patterns:
+        matches = re.findall(pattern, message_content, re.DOTALL | re.IGNORECASE)
+        all_code_blocks.extend(matches)
+    
+    # Si no hay bloques de código explícitos, buscar código suelto
+    if not all_code_blocks:
+        lines = message_content.split('\n')
+        code_lines = []
+        in_code = False
         
-        if 'pygame' in message_content and 'snake_game' not in [f.lower() for f in files_created]:
-            code_blocks = re.findall(r'```python\n(.*?)```', message_content, re.DOTALL)
-            for block in code_blocks:
-                if 'pygame' in block:
-                    filepath = os.path.join(OUTPUT_DIR, 'snake_game.py')
-                    with open(filepath, 'w', encoding='utf-8') as f:
-                        f.write(block.strip())
-                    files_created.append('snake_game.py')
-                    print(f"[OK] {agent_name} -> snake_game.py extraido automaticamente")
-                    break
+        for line in lines:
+            stripped = line.strip()
+            if any(stripped.startswith(kw) for kw in ['import ', 'from ', 'class ', 'def ', '@']):
+                in_code = True
+            
+            if in_code:
+                code_lines.append(line)
+                if not stripped or (stripped and not any(c in stripped for c in ['(', ')', ':', '=', '[', ']', '{', '}']) and len(stripped.split()) > 5):
+                    if len(code_lines) > 10:
+                        all_code_blocks.append('\n'.join(code_lines))
+                    code_lines = []
+                    in_code = False
+    
+    # Procesar cada bloque de código encontrado
+    for idx, code_block in enumerate(all_code_blocks):
+        code_block = code_block.strip()
+        
+        if len(code_block) < 30:  # Ignorar bloques muy pequeños
+            continue
+        
+        filename = None
+        
+        # ESTRATEGIA 1: Buscar comentario con nombre de archivo en el bloque
+        first_lines = '\n'.join(code_block.split('\n')[:5])
+        file_match = re.search(r'#\s*(?:output/)?([a-zA-Z0-9_]+\.(?:py|txt|md))', first_lines)
+        if file_match:
+            filename = file_match.group(1)
+            # Limpiar el comentario del código
+            code_block = re.sub(r'^#\s*(?:output/)?[a-zA-Z0-9_]+\.(?:py|txt|md).*?\n', '', code_block, count=1, flags=re.MULTILINE)
+        
+        # ESTRATEGIA 2: Detectar por contenido del código
+        if not filename:
+            # Python files
+            if any(keyword in code_block for keyword in ['import ', 'class ', 'def ']):
+                # Detectar snake_logic.py
+                if ('class Snake' in code_block or 'class Food' in code_block or 'class GameState' in code_block) and 'pygame' not in code_block.lower():
+                    filename = 'snake_logic.py'
+                
+                # Detectar snake_game.py
+                elif 'pygame' in code_block.lower() and any(x in code_block for x in ['class ', 'def ']):
+                    filename = 'snake_game.py'
+                
+                # Detectar test files
+                elif 'unittest' in code_block and ('class Test' in code_block or 'def test_' in code_block):
+                    filename = 'test_snake.py'
+                
+                # Detectar config files
+                elif 'config' in code_block.lower() and 'class' in code_block:
+                    filename = 'config.py'
+                
+                # Detectar utils/helpers
+                elif any(word in code_block.lower() for word in ['helper', 'util', 'tool']):
+                    filename = 'utils.py'
+                
+                # Archivo genérico basado en la primera clase o función
+                elif not filename:
+                    class_match = re.search(r'class\s+([A-Za-z0-9_]+)', code_block)
+                    if class_match:
+                        filename = f"{class_match.group(1).lower()}.py"
+                    else:
+                        def_match = re.search(r'def\s+([a-z_][a-z0-9_]*)', code_block)
+                        if def_match:
+                            filename = f"{def_match.group(1)}.py"
+            
+            # README files
+            elif code_block.startswith('#') and any(word in code_block.lower() for word in ['snake', 'game', 'project', 'installation', 'usage']):
+                filename = 'README.md'
+            
+            # Requirements files
+            elif any(pkg in code_block.lower() for pkg in ['pygame', 'numpy', 'pytest', '==', '>=']):
+                filename = 'requirements.txt'
+            
+            # Config files (JSON, YAML, etc)
+            elif code_block.strip().startswith('{') or 'version:' in code_block:
+                filename = 'config.json' if '{' in code_block else 'config.yaml'
+        
+        # ESTRATEGIA 3: Usar nombre genérico si no se puede detectar
+        if not filename:
+            if 'import' in code_block or 'class' in code_block or 'def' in code_block:
+                filename = f'generated_code_{idx}.py'
+            elif code_block.startswith('#'):
+                filename = f'document_{idx}.md'
+            else:
+                filename = f'file_{idx}.txt'
+        
+        # Guardar archivo si no existe ya
+        if filename and filename not in files_created:
+            filepath = os.path.join(OUTPUT_DIR, filename)
+            
+            # Si el archivo ya existe, no sobrescribirlo a menos que el nuevo código sea más largo
+            if os.path.exists(filepath):
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    existing_content = f.read()
+                if len(existing_content) >= len(code_block):
+                    print(f"⏭️  [{agent_name}] -> {filename} ya existe con más contenido, saltando...")
+                    continue
+            
+            try:
+                # Auto-completar imports si es necesario
+                if filename.endswith('.py'):
+                    if 'snake_logic' in filename:
+                        if 'import random' not in code_block:
+                            code_block = 'import random\n' + code_block
+                        if 'from enum import Enum' not in code_block and 'Enum' in code_block:
+                            code_block = 'from enum import Enum\n' + code_block
+                    elif 'snake_game' in filename or 'game' in filename.lower():
+                        if 'import pygame' not in code_block and 'pygame' in code_block.lower():
+                            code_block = 'import pygame\nimport sys\n' + code_block
+                    elif 'test' in filename:
+                        if 'import unittest' not in code_block:
+                            code_block = 'import unittest\n' + code_block
+                
+                with open(filepath, 'w', encoding='utf-8') as f:
+                    f.write(code_block)
+                files_created.append(filename)
+                print(f"✅ [{agent_name}] -> {filename} guardado ({len(code_block)} caracteres)")
+            except Exception as e:
+                print(f"❌ Error guardando {filename}: {e}")
     
     return files_created
 
-# AGENTE COORDINADOR PRINCIPAL CON ESCRITURA DE ARCHIVOS
+# CLASE CUSTOM PARA INTERCEPTAR MENSAJES
+class CustomGroupChatManager(GroupChatManager):
+    """Manager personalizado que intercepta y procesa mensajes"""
+    
+    def _process_received_message(self, message, sender, silent):
+        """Sobrescribimos este método para interceptar mensajes"""
+        # Procesar el mensaje primero
+        result = super()._process_received_message(message, sender, silent)
+        
+        # Extraer código si el mensaje lo contiene
+        if isinstance(message, dict) and "content" in message:
+            content = message["content"]
+            sender_name = sender.name if hasattr(sender, 'name') else "Unknown"
+            
+            if sender_name in ['DesarrolladorLogica', 'DesarrolladorInterfaz', 'TesterDebugger', 'Documentador']:
+                if '```' in content:
+                    print(f"\n🔍 Interceptado mensaje de {sender_name}, extrayendo código...")
+                    extract_and_save_code(content, sender_name)
+        
+        return result
+
+# AGENTE COORDINADOR PRINCIPAL
 coordinador_principal = AssistantAgent(
     name="CoordinadorPrincipal",
-    system_message="""Eres el Coordinador Principal de un sistema multiagente jerárquico para desarrollar el juego Snake usando Llama3.
+    system_message="""Eres el Coordinador Principal. Tu trabajo es pedir a cada agente que genere su archivo.
 
-INSTRUCCIONES CRÍTICAS PARA GENERAR ARCHIVOS:
-- Cada vez que coordines una tarea, asegúrate de que el agente genere código COMPLETO
-- El código debe estar en bloques ```python con comentarios que especifiquen el nombre del archivo
-- Ejemplo correcto:
-```python
-# output/snake_logic.py
-class Snake:
-    def __init__(self):
-        # código completo aquí
-        pass
-```
+PROCESO SIMPLE:
+1. Pide a DesarrolladorLogica que genere snake_logic.py
+2. Pide a DesarrolladorInterfaz que genere snake_game.py
+3. Pide a TesterDebugger que genere test_snake.py
+4. Pide a Documentador que genere README.md y requirements.txt
 
-TU ROL COMO LÍDER:
-- Liderar y coordinar el desarrollo completo del juego Snake
-- EXIGIR que cada agente genere archivos completos y funcionales
-- Revisar e integrar las contribuciones de todos los agentes especializados  
-- Asegurar que TODOS los archivos se generen correctamente
-
-ARQUITECTURA DEL PROYECTO SNAKE:
-1. Lógica del juego (Snake, Food, GameState) -> snake_logic.py
-2. Interfaz gráfica (Pygame) -> snake_game.py
-3. Testing y validación -> test_snake.py
-4. Documentación -> README.md, requirements.txt
-
-FLUJO DE TRABAJO:
-1. Pedir a DesarrolladorLogica que genere snake_logic.py COMPLETO
-2. Pedir a DesarrolladorInterfaz que genere snake_game.py COMPLETO
-3. Pedir a TesterDebugger que genere test_snake.py COMPLETO
-4. Pedir a Documentador que genere README.md y requirements.txt COMPLETOS
-
-IMPORTANTE: 
-- NO aceptes respuestas parciales o incompletas
-- Cada archivo debe tener al menos 100 líneas de código funcional
-- Verifica que cada agente genere su archivo antes de continuar
-
-Cuando todos los archivos estén generados, di "DESARROLLO SNAKE COMPLETADO - TODOS LOS ARCHIVOS CREADOS".""",
+Coordina paso a paso. Cuando todos los archivos estén listos, di: "COMPLETADO".""",
     llm_config=ollama_config_llama3,
 )
 
-# AGENTE DESARROLLADOR DE LÓGICA MEJORADO
+# AGENTE DESARROLLADOR DE LÓGICA
 desarrollador_logica = AssistantAgent(
     name="DesarrolladorLogica",
-    system_message="""Eres un agente especializado en el desarrollo de la lógica core del juego Snake.
+    system_message="""Genera el archivo snake_logic.py con las clases Snake, Food y GameState.
 
-TAREA CRÍTICA: Debes generar el archivo snake_logic.py COMPLETO y FUNCIONAL.
+IMPORTANTE: Genera código completo y funcional en un bloque ```python
 
-ESTRUCTURA OBLIGATORIA:
+Ejemplo mínimo:
 ```python
-# output/snake_logic.py
 import random
 from enum import Enum
 
@@ -187,615 +268,206 @@ class Direction(Enum):
     RIGHT = (1, 0)
 
 class Snake:
-    def __init__(self, x=10, y=10):
-        self.body = [(x, y)]
+    def __init__(self):
+        self.body = [(10, 10)]
         self.direction = Direction.RIGHT
-        self.grow_pending = False
     
     def move(self):
-        # Implementar movimiento completo
-        pass
+        head_x, head_y = self.body[0]
+        dx, dy = self.direction.value
+        new_head = (head_x + dx, head_y + dy)
+        self.body.insert(0, new_head)
+        self.body.pop()
     
     def grow(self):
-        # Implementar crecimiento
-        pass
-    
-    def check_collision(self, width, height):
-        # Implementar detección de colisiones
-        pass
+        self.body.append(self.body[-1])
 
 class Food:
     def __init__(self, width, height):
-        self.position = self.generate_position(width, height)
-    
-    def generate_position(self, width, height):
-        # Implementar generación de comida
-        pass
+        self.position = (random.randint(0, width-1), random.randint(0, height-1))
 
 class GameState:
-    def __init__(self, width=40, height=30):
-        self.width = width
-        self.height = height
-        self.snake = Snake()
-        self.food = Food(width, height)
-        self.score = 0
-        self.game_over = False
-    
-    def update(self):
-        # Implementar lógica de actualización
-        pass
-    
-    def reset(self):
-        # Implementar reset del juego
-        pass
-```
-
-REQUISITOS:
-- El archivo debe tener mínimo 150 líneas de código
-- Todas las funciones deben estar implementadas completamente
-- Incluir manejo de errores y validaciones
-- Código limpio y bien comentado
-
-GENERA EL ARCHIVO COMPLETO AHORA. No des explicaciones, solo el código completo entre ```python y ```.""",
-    llm_config=ollama_config_codeqwen,
-)
-
-# AGENTE DESARROLLADOR DE INTERFAZ MEJORADO
-desarrollador_interfaz = AssistantAgent(
-    name="DesarrolladorInterfaz", 
-    system_message="""Eres un agente especializado en el desarrollo de la interfaz gráfica del juego Snake usando Pygame.
-
-TAREA CRÍTICA: Debes generar el archivo snake_game.py COMPLETO y EJECUTABLE.
-
-ESTRUCTURA OBLIGATORIA:
-```python
-# output/snake_game.py
-import pygame
-import sys
-from snake_logic import Snake, Food, GameState, Direction
-
-# Configuración de colores
-BLACK = (0, 0, 0)
-GREEN = (0, 255, 0)
-RED = (255, 0, 0)
-WHITE = (255, 255, 255)
-
-# Configuración de la ventana
-WINDOW_WIDTH = 800
-WINDOW_HEIGHT = 600
-CELL_SIZE = 20
-
-class SnakeGame:
     def __init__(self):
-        pygame.init()
-        self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
-        pygame.display.set_caption("Snake Game - SMA")
-        self.clock = pygame.time.Clock()
-        self.game_state = GameState()
-        self.running = True
-    
-    def handle_events(self):
-        # Implementar manejo de eventos completo
-        pass
-    
-    def update_game(self):
-        # Implementar actualización del juego
-        pass
-    
-    def render(self):
-        # Implementar renderizado completo
-        pass
-    
-    def run(self):
-        # Bucle principal del juego
-        while self.running:
-            self.handle_events()
-            self.update_game()
-            self.render()
-            self.clock.tick(10)
-        
-        pygame.quit()
-        sys.exit()
-
-if __name__ == "__main__":
-    game = SnakeGame()
-    game.run()
-```
-
-REQUISITOS:
-- El archivo debe tener mínimo 200 líneas de código
-- Debe importar correctamente desde snake_logic.py
-- Implementar todos los métodos completamente
-- Incluir pantalla de game over y puntuación
-- Debe ser ejecutable inmediatamente
-
-GENERA EL ARCHIVO COMPLETO AHORA. Solo código entre ```python y ```.""",
-    llm_config=ollama_config_codeqwen,
-)
-
-# AGENTE TESTER MEJORADO
-tester_debugger = AssistantAgent(
-    name="TesterDebugger",
-    system_message="""Eres un agente especializado en testing y debugging del juego Snake.
-
-TAREA CRÍTICA: Debes generar el archivo test_snake.py COMPLETO con todos los tests.
-
-ESTRUCTURA OBLIGATORIA:
-```python
-# output/test_snake.py
-import unittest
-import sys
-import os
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-from snake_logic import Snake, Food, GameState, Direction
-
-class TestSnakeLogic(unittest.TestCase):
-    def setUp(self):
         self.snake = Snake()
         self.food = Food(40, 30)
-        self.game_state = GameState()
-    
-    def test_snake_initialization(self):
-        # Test inicialización de serpiente
-        pass
-    
-    def test_snake_movement(self):
-        # Test movimiento de serpiente
-        pass
-    
-    def test_snake_growth(self):
-        # Test crecimiento de serpiente
-        pass
-    
-    def test_collision_detection(self):
-        # Test detección de colisiones
-        pass
-    
-    def test_food_generation(self):
-        # Test generación de comida
-        pass
-    
-    def test_game_state_update(self):
-        # Test actualización del estado
-        pass
-    
-    def test_score_system(self):
-        # Test sistema de puntuación
-        pass
-
-class TestGameIntegration(unittest.TestCase):
-    def setUp(self):
-        self.game = GameState()
-    
-    def test_full_game_cycle(self):
-        # Test ciclo completo del juego
-        pass
-    
-    def test_game_reset(self):
-        # Test reset del juego
-        pass
-
-if __name__ == '__main__':
-    unittest.main()
+        self.score = 0
+        self.game_over = False
 ```
 
-REQUISITOS:
-- Mínimo 15 tests diferentes
-- Cada test debe estar completamente implementado
-- Incluir tests de integración
-- Tests de casos extremos
-- Mínimo 100 líneas de código
+Genera AHORA el código completo.""",
+    llm_config=ollama_config_codeqwen,
+)
 
-GENERA EL ARCHIVO COMPLETO AHORA. Solo código entre ```python y ```.""",
+desarrollador_interfaz = AssistantAgent(
+    name="DesarrolladorInterfaz", 
+    system_message="""Genera snake_game.py con la interfaz Pygame.
+
+Genera código completo en un bloque ```python que importe de snake_logic.
+
+Debe incluir:
+- Importar pygame y clases de snake_logic
+- Clase SnakeGame con init, handle_events, update, render, run
+- Bucle principal del juego
+- if __name__ == "__main__"
+
+Genera AHORA el código completo.""",
+    llm_config=ollama_config_codeqwen,
+)
+
+tester_debugger = AssistantAgent(
+    name="TesterDebugger",
+    system_message="""Genera test_snake.py con tests unitarios.
+
+Genera código completo en un bloque ```python con:
+- import unittest
+- from snake_logic import Snake, Food, GameState
+- Clases TestSnake con varios test_
+- if __name__ == '__main__': unittest.main()
+
+Genera AHORA el código completo.""",
     llm_config=ollama_config_codellama,
 )
 
-# AGENTE DOCUMENTADOR MEJORADO
 documentador = AssistantAgent(
     name="Documentador",
-    system_message="""Eres un agente especializado en crear documentación técnica completa para el juego Snake.
+    system_message="""Genera README.md y requirements.txt.
 
-TAREA CRÍTICA: Debes generar README.md y requirements.txt COMPLETOS.
-
-GENERA PRIMERO requirements.txt:
+Primero requirements.txt en un bloque ```txt:
 ```txt
-# output/requirements.txt
 pygame>=2.5.0
-psutil>=5.9.0
 ```
 
-LUEGO GENERA README.md COMPLETO:
-```markdown
-# output/README.md
-# 🐍 Snake Game - Sistema Multiagente
+Luego README.md en un bloque ```markdown con:
+- Título
+- Descripción
+- Instalación
+- Uso
+- Controles
 
-## Descripción
-Juego Snake desarrollado usando un Sistema Multiagente (SMA) jerárquico con diferentes modelos de Ollama.
-
-## Arquitectura del Sistema
-- **CoordinadorPrincipal** (Llama3): Coordinación general
-- **DesarrolladorLogica** (CodeQwen): Lógica del juego
-- **DesarrolladorInterfaz** (CodeQwen): Interfaz Pygame
-- **TesterDebugger** (CodeLlama): Testing y debugging
-- **Documentador** (Mistral): Documentación
-
-## Instalación
-
-### Requisitos Previos
-- Python 3.12+
-- Ollama instalado y configurado
-
-### Modelos Ollama Necesarios
-```bash
-ollama pull llama3
-ollama pull codeqwen
-ollama pull codellama
-ollama pull mistral
-```
-
-### Instalación de Dependencias
-```bash
-pip install -r requirements.txt
-```
-
-## Uso
-
-### Ejecutar el Juego
-```bash
-python snake_game.py
-```
-
-### Ejecutar Tests
-```bash
-python test_snake.py
-```
-
-## Controles
-- ↑: Arriba
-- ↓: Abajo
-- ←: Izquierda
-- →: Derecha
-- ESC: Salir
-
-## Estructura de Archivos
-```
-output/
-├── snake_logic.py      # Lógica del juego
-├── snake_game.py       # Interfaz gráfica
-├── test_snake.py       # Tests unitarios
-├── README.md           # Este archivo
-└── requirements.txt    # Dependencias
-```
-
-## Desarrollo
-El proyecto fue desarrollado usando un SMA jerárquico con 5 agentes especializados.
-
-## Licencia
-MIT License
-```
-
-REQUISITOS:
-- README debe tener mínimo 80 líneas
-- Incluir toda la información necesaria
-- Formateo markdown correcto
-- Instrucciones claras y completas
-
-GENERA AMBOS ARCHIVOS COMPLETOS AHORA.""",
+Genera AHORA ambos archivos.""",
     llm_config=ollama_config_mistral,
 )
 
-# AGENTE COORDINADOR LOCAL MEJORADO
+# AGENTE COORDINADOR LOCAL
 coordinador_usuario = UserProxyAgent(
     name="CoordinadorUsuario",
     human_input_mode="NEVER",
     code_execution_config=False,
-    max_consecutive_auto_reply=2,
-    is_termination_msg=lambda msg: any(keyword in msg.get("content", "").lower() for keyword in [
-        "desarrollo snake completado",
-        "todos los archivos creados",
-        "archivos generados correctamente"
-    ]),
-    system_message="""Eres el coordinador local que facilita la comunicación y EXTRAE AUTOMÁTICAMENTE LOS ARCHIVOS.
-
-FUNCIÓN CRÍTICA: Después de cada mensaje de un agente especializado, debes:
-1. Buscar código en el mensaje
-2. Extraer y guardar automáticamente en archivos
-3. Confirmar que el archivo se guardó correctamente
-
-Termina cuando todos los archivos estén creados: snake_logic.py, snake_game.py, test_snake.py, README.md, requirements.txt""",
+    max_consecutive_auto_reply=1,
+    is_termination_msg=lambda msg: "completado" in msg.get("content", "").lower(),
 )
 
-# FUNCIÓN PARA PROCESAR MENSAJES DESPUÉS DEL CHAT
-def process_messages_after_chat(messages):
-    """Procesa todos los mensajes después del chat para extraer código"""
-    files_created = []
-    
-    for message in messages:
-        if hasattr(message, 'get') and message.get('content'):
-            content = message.get('content', '')
-            sender_name = message.get('name', 'Unknown')
-            
-            # Solo procesar mensajes de agentes especializados
-            if sender_name in ['DesarrolladorLogica', 'DesarrolladorInterfaz', 'TesterDebugger', 'Documentador']:
-                extracted_files = extract_and_save_code(content, sender_name)
-                files_created.extend(extracted_files)
-                if extracted_files:
-                    print(f"Archivos extraidos de {sender_name}: {', '.join(extracted_files)}")
-    
-    return files_created
-
-# Framework de testing mejorado
+# Framework de testing
 class Caso2TestFramework:
     def __init__(self):
         self.start_time = time.time()
         self.process = psutil.Process()
-        self.results = {
-            "timestamp": datetime.now().isoformat(),
-            "performance": {},
-            "validation": {},
-            "architecture": {},
-            "integration": {},
-            "files_created": []
-        }
-    
-    def monitor_performance(self):
-        """Monitorea el rendimiento del sistema"""
-        memory_mb = self.process.memory_info().rss / 1024 / 1024
-        cpu_percent = self.process.cpu_percent()
-        
-        self.results["performance"] = {
-            "memory_usage_mb": round(memory_mb, 2),
-            "cpu_usage_percent": round(cpu_percent, 2),
-            "execution_time_seconds": round(time.time() - self.start_time, 2)
-        }
+        self.results = {}
     
     def validate_files_created(self):
-        """Valida que se hayan creado todos los archivos esperados"""
-        expected_files = [
-            'snake_logic.py',
-            'snake_game.py', 
-            'test_snake.py',
-            'README.md',
-            'requirements.txt'
-        ]
-        
+        """Valida archivos creados"""
+        expected_files = ['snake_logic.py', 'snake_game.py', 'test_snake.py', 'README.md', 'requirements.txt']
         created_files = []
+        
         if os.path.exists(OUTPUT_DIR):
             created_files = [f for f in os.listdir(OUTPUT_DIR) if f in expected_files]
         
-        self.results["files_created"] = {
+        return {
             "expected": expected_files,
             "created": created_files,
-            "completion_percentage": round(len(created_files) / len(expected_files) * 100, 2),
-            "missing": [f for f in expected_files if f not in created_files]
+            "completion": len(created_files) / len(expected_files) * 100
         }
     
-    def validate_file_content(self):
-        """Valida el contenido de los archivos creados"""
-        file_validations = {}
+    def generate_report(self):
+        """Genera reporte final"""
+        files_info = self.validate_files_created()
         
-        validations = {
-            'snake_logic.py': ['class Snake', 'class Food', 'class GameState'],
-            'snake_game.py': ['pygame', 'SnakeGame', 'if __name__'],
-            'test_snake.py': ['unittest', 'TestSnake', 'def test_'],
-            'README.md': ['# Snake Game', '## Installation', '## Usage'],
-            'requirements.txt': ['pygame']
+        self.results = {
+            "timestamp": datetime.now().isoformat(),
+            "files": files_info,
+            "execution_time": round(time.time() - self.start_time, 2)
         }
         
-        for filename, required_content in validations.items():
-            filepath = os.path.join(OUTPUT_DIR, filename)
-            if os.path.exists(filepath):
-                try:
-                    with open(filepath, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                    
-                    validations_passed = sum(1 for req in required_content if req in content)
-                    file_validations[filename] = {
-                        "exists": True,
-                        "size_bytes": len(content),
-                        "validations_passed": validations_passed,
-                        "validations_total": len(required_content),
-                        "is_valid": validations_passed >= len(required_content) * 0.8
-                    }
-                except Exception as e:
-                    file_validations[filename] = {
-                        "exists": True,
-                        "error": str(e),
-                        "is_valid": False
-                    }
-            else:
-                file_validations[filename] = {
-                    "exists": False,
-                    "is_valid": False
-                }
-        
-        self.results["file_validation"] = file_validations
-    
-    def generate_report(self, messages):
-        """Genera el reporte final completo"""
-        self.monitor_performance()
-        self.validate_files_created()
-        self.validate_file_content()
-        
-        # Calcular score general basado en archivos creados
-        files_score = self.results["files_created"]["completion_percentage"]
-        
-        if "file_validation" in self.results:
-            valid_files = sum(1 for f in self.results["file_validation"].values() if f.get("is_valid", False))
-            total_files = len(self.results["file_validation"])
-            validation_score = (valid_files / total_files * 100) if total_files > 0 else 0
-        else:
-            validation_score = 0
-        
-        self.results["overall_score"] = round((files_score + validation_score) / 2, 2)
-        
-        # Guardar reporte
-        report_path = os.path.join(OUTPUT_DIR, "caso2_snake_report.json")
+        report_path = os.path.join(OUTPUT_DIR, "caso2_report.json")
         with open(report_path, "w", encoding="utf-8") as f:
-            json.dump(self.results, f, indent=2, ensure_ascii=False)
+            json.dump(self.results, f, indent=2)
         
-        print(f"\n=== REPORTE FINAL CASO 2 - DESARROLLO SNAKE ===")
-        print(f"Score General: {self.results['overall_score']}%")
-        print(f"Archivos Creados: {len(self.results['files_created']['created'])}/5")
-        print(f"Archivos Validos: {sum(1 for f in self.results.get('file_validation', {}).values() if f.get('is_valid', False))}")
+        print(f"\n{'='*50}")
+        print(f"REPORTE FINAL")
+        print(f"{'='*50}")
+        print(f"Archivos creados: {len(files_info['created'])}/5")
+        print(f"Completitud: {files_info['completion']:.1f}%")
+        print(f"Tiempo: {self.results['execution_time']}s")
         
-        if self.results['files_created']['missing']:
-            print(f"Archivos Faltantes: {', '.join(self.results['files_created']['missing'])}")
+        for file in files_info['created']:
+            filepath = os.path.join(OUTPUT_DIR, file)
+            size = os.path.getsize(filepath)
+            print(f"  ✅ {file} ({size} bytes)")
         
-        print(f"Tiempo Total: {self.results['performance']['execution_time_seconds']}s")
-        print(f"Memoria Usada: {self.results['performance']['memory_usage_mb']} MB")
-        print(f"Reporte guardado en: {report_path}")
-        
-        return self.results["overall_score"] >= 80
+        for file in files_info['expected']:
+            if file not in files_info['created']:
+                print(f"  ❌ {file} (no generado)")
 
-# Configurar el chat grupal
+# Configurar chat grupal
 participantes = [coordinador_usuario, coordinador_principal, desarrollador_logica, 
                 desarrollador_interfaz, tester_debugger, documentador]
 
 chat_grupal = GroupChat(
     agents=participantes,
     messages=[],
-    max_round=15,  # Aumentar rondas para dar tiempo a generar archivos
+    max_round=12,
     speaker_selection_method="round_robin",
 )
 
-gestor = GroupChatManager(
-    groupchat=chat_grupal, 
-    llm_config=ollama_config_llama3
-)
+gestor = CustomGroupChatManager(groupchat=chat_grupal, llm_config=ollama_config_llama3)
 
-# Inicializar framework de testing
+# Inicializar framework
 test_framework = Caso2TestFramework()
 
-# Mensaje inicial mejorado
-mensaje_inicial = """
-PROYECTO CRITICO: Desarrollo del Juego Snake con SMA Jerarquico
+# Mensaje inicial
+mensaje_inicial = """Inicia el desarrollo del juego Snake.
 
-INSTRUCCION CRITICA PARA TODOS LOS AGENTES:
-Cada agente DEBE generar su archivo completo usando el formato exacto:
+Cada agente debe generar su archivo:
+- DesarrolladorLogica: snake_logic.py
+- DesarrolladorInterfaz: snake_game.py
+- TesterDebugger: test_snake.py
+- Documentador: README.md y requirements.txt
 
-```python
-# output/nombre_archivo.py
-[CODIGO COMPLETO AQUI]
-```
+Genera código completo en bloques ```python
 
-ARCHIVOS REQUERIDOS OBLIGATORIOS:
-1. snake_logic.py - DesarrolladorLogica (clases Snake, Food, GameState)
-2. snake_game.py - DesarrolladorInterfaz (interfaz Pygame completa) 
-3. test_snake.py - TesterDebugger (tests unitarios completos)
-4. README.md - Documentador (documentacion tecnica)
-5. requirements.txt - Documentador (dependencias)
+CoordinadorPrincipal: Coordina a cada agente paso a paso."""
 
-OBJETIVO: Crear TODOS los archivos funcionales del juego Snake
-TIEMPO LIMITE: 10 minutos
-DIRECTORIO: output/
-
-CoordinadorPrincipal: Coordina a cada agente para que genere su archivo COMPLETO y FUNCIONAL. 
-NO aceptes codigo parcial o incompleto. Cada archivo debe tener minimo 100 lineas de codigo real.
-
-COMIENZA EL DESARROLLO AHORA!"""
-
-# Ejecutar el sistema
+# Ejecutar
 try:
-    print("=== INICIANDO DESARROLLO DEL JUEGO SNAKE ===")
-    print("Extraccion automatica de codigo activada")
-    print("Generacion de archivos al final del chat")
-    print("=" * 50)
+    print("="*50)
+    print("INICIANDO DESARROLLO SNAKE")
+    print("="*50)
     
-    # Función para ejecutar con timeout
-    def ejecutar_chat():
-        try:
-            result = coordinador_usuario.initiate_chat(
-                gestor, 
-                message=mensaje_inicial
-            )
-            return result
-        except Exception as e:
-            print(f"Error en el chat: {e}")
-            return None
+    coordinador_usuario.initiate_chat(gestor, message=mensaje_inicial)
     
-    # Ejecutar con timeout
-    import signal
-    
-    def timeout_handler(signum, frame):
-        raise TimeoutError("Tiempo límite excedido")
-    
-    # Configurar timeout (solo en sistemas Unix)
-    try:
-        signal.signal(signal.SIGALRM, timeout_handler)
-        signal.alarm(600)  # 10 minutos
-        result = ejecutar_chat()
-        signal.alarm(0)  # Cancelar timeout
-    except (AttributeError, OSError):
-        # En Windows o sistemas sin señales, usar threading
-        resultado_queue = Queue()
-        
-        def ejecutar_chat_thread():
-            try:
-                result = ejecutar_chat()
-                resultado_queue.put(("success", result))
-            except Exception as e:
-                resultado_queue.put(("error", e))
-        
-        chat_thread = threading.Thread(target=ejecutar_chat_thread)
-        chat_thread.daemon = True
-        chat_thread.start()
-        chat_thread.join(timeout=600)
-        
-        if chat_thread.is_alive():
-            print("\nTiempo limite excedido (10 minutos)")
-        elif not resultado_queue.empty():
-            status, result = resultado_queue.get()
-            if status == "error":
-                raise result
-
 except Exception as e:
-    print(f"\nError durante la ejecucion: {e}")
+    print(f"Error: {e}")
+    import traceback
+    traceback.print_exc()
 finally:
-    # Procesar mensajes y extraer archivos al final
-    try:
-        if 'chat_grupal' in locals():
-            conversation = getattr(chat_grupal, 'messages', [])
-            
-            # Extraer archivos de la conversacion
-            print("\n=== PROCESANDO MENSAJES PARA EXTRAER ARCHIVOS ===")
-            files_created = process_messages_after_chat(conversation)
-            
-            # Generar reporte
-            success = test_framework.generate_report(conversation)
-            
-            # Mostrar archivos creados
-            if os.path.exists(OUTPUT_DIR):
-                archivos = [f for f in os.listdir(OUTPUT_DIR) if not f.endswith('.json')]
-                if archivos:
-                    print(f"\nARCHIVOS GENERADOS EN {OUTPUT_DIR}/:")
-                    for archivo in sorted(archivos):
-                        filepath = os.path.join(OUTPUT_DIR, archivo)
-                        size = os.path.getsize(filepath)
-                        print(f"   [OK] {archivo} ({size} bytes)")
-                else:
-                    print(f"\nNo se generaron archivos en {OUTPUT_DIR}/")
-                    print("POSIBLES SOLUCIONES:")
-                    print("   1. Verificar que Ollama este ejecutandose: ollama serve")
-                    print("   2. Verificar modelos: ollama list")
-                    print("   3. Probar conexion: curl http://localhost:11434/api/tags")
-            
-            if success:
-                print(f"\nDESARROLLO COMPLETADO EXITOSAMENTE!")
-                print(f"Ejecutar juego: python {OUTPUT_DIR}/snake_game.py")
-                print(f"Ejecutar tests: python {OUTPUT_DIR}/test_snake.py")
-            else:
-                print(f"\nDesarrollo incompleto. Revisar archivos generados.")
-        
-        print(f"\nRESUMEN FINAL:")
-        print(f"   • Directorio: {OUTPUT_DIR}/")
-        print(f"   • Reporte: caso2_snake_report.json")
-        print(f"   • Logs: Ver consola para detalles")
-        
-    except Exception as report_error:
-        print(f"\nError generando reporte: {report_error}")
-
-print("\n" + "="*50)
-print("SISTEMA MULTIAGENTE SNAKE - FINALIZADO")
-print("="*50)
+    # Procesar mensajes al final como fallback
+    print("\n" + "="*50)
+    print("POST-PROCESAMIENTO DE MENSAJES")
+    print("="*50)
+    
+    if hasattr(chat_grupal, 'messages'):
+        for msg in chat_grupal.messages:
+            if isinstance(msg, dict) and 'content' in msg and 'name' in msg:
+                sender_name = msg['name']
+                content = msg['content']
+                if sender_name in ['DesarrolladorLogica', 'DesarrolladorInterfaz', 'TesterDebugger', 'Documentador']:
+                    if '```' in content:
+                        print(f"\n📝 Procesando mensaje almacenado de {sender_name}...")
+                        extract_and_save_code(content, sender_name)
+    
+    test_framework.generate_report()
+    
+    print(f"\n{'='*50}")
+    print("DESARROLLO FINALIZADO")
+    print(f"Archivos en: {OUTPUT_DIR}/")
+    print(f"{'='*50}")

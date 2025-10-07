@@ -1,4 +1,4 @@
 psutil == 7.0.0
 
 autogen == 0.9.2
-unittest== 1.0.2
+ag2[openai] == 0.9.10
